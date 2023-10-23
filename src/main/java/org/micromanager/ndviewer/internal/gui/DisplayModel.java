@@ -124,6 +124,7 @@ public class DisplayModel {
       if (newSourceDataWidth < 5 || newSourceDataHeight < 5) {
          return; //constrain maximum zoom
       }
+      /*
       if (data_.getBounds() != null) {
          //don't let either of these go bigger than the actual data
          double overzoomXFactor = newSourceDataWidth / (viewCoords_.xMax_ - viewCoords_.xMin_);
@@ -133,6 +134,8 @@ public class DisplayModel {
             newSourceDataHeight = newSourceDataHeight / Math.max(overzoomXFactor, overzoomYFactor);
          }
       }
+
+       */
       viewCoords_.setFullResSourceDataSize(newSourceDataWidth, newSourceDataHeight);
 
       double xOffset = (zoomCenter.x - (zoomCenter.x - viewOffset.x)
@@ -140,6 +143,7 @@ public class DisplayModel {
       double yOffset = (zoomCenter.y - (zoomCenter.y - viewOffset.y)
               * newSourceDataHeight / sourceDataSize.y);
       //make sure view doesn't go outside image bounds
+      /*
       if (data_.getBounds() != null) {
          viewCoords_.setViewOffset(
                  Math.max(viewCoords_.xMin_, Math.min(xOffset,
@@ -147,8 +151,10 @@ public class DisplayModel {
                  Math.max(viewCoords_.yMin_, Math.min(yOffset,
                          viewCoords_.yMax_ - viewCoords_.getFullResSourceDataSize().y)));
       } else {
+
+       */
          viewCoords_.setViewOffset(xOffset, yOffset);
-      }
+     // }
    }
 
    public void onCanvasResize(int w, int h) {
