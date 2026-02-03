@@ -1,0 +1,425 @@
+// NDViewerXYExample.bsh
+//
+// Beanshell script for Micro-Manager that demonstrates using the NDViewer API
+// to display images acquired at different XY stage positions.
+//
+// This script:
+// 1. Snaps 4 images at different XY locations (in a 2x2 grid pattern)
+// 2. Stores them in NDTiff format with row/column coordinates
+// 3. Displays them in NDViewer at the appropriate XY locations (stitched view)
+//
+// The key insight is that NDViewer with multi-resolution NDTiff storage
+// can stitch images together based on their row/column indices and the
+// overlap settings, displaying them as one continuous field of view.
+
+import java.io.File;
+import java.util.HashMap;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import mmcorej.TaggedImage;
+import mmcorej.org.json.JSONObject;
+import org.micromanager.ndtiffstorage.NDTiffStorage;
+import org.micromanager.ndtiffstorage.MultiresNDTiffAPI;
+import org.micromanager.ndviewer.api.NDViewerAPI;
+import org.micromanager.ndviewer.api.NDViewerAcqInterface;
+import org.micromanager.ndviewer.api.NDViewerDataSource;
+import org.micromanager.ndviewer.api.CanvasMouseListenerInterface;
+import org.micromanager.ndviewer.main.NDViewer;
+import java.awt.Point;
+import java.awt.event.MouseEvent;
+import java.awt.event.MouseWheelEvent;
+import javax.swing.SwingUtilities;
+
+// ======================== USER SETTINGS ========================
+
+// Grid size (2x2 = 4 images)
+int numRows = 2;
+int numCols = 2;
+
+// Stage movement step in microns (distance between tile centers)
+// Adjust based on your camera FOV and desired overlap
+double stepSizeUm = 100.0;  // Microns between positions
+
+// Overlap in pixels (how much adjacent tiles overlap)
+// Set to 0 for no overlap, or positive value for overlapping tiles
+int overlapPixels = 0;
+
+// Save directory (set to null for RAM-only, no disk storage)
+String saveDir = null;  // Example: "C:\\temp\\NDViewerTest"
+String acqName = "XYGrid_" + System.currentTimeMillis();
+
+// ===============================================================
+
+// Get core and XY stage info
+mmc = mm.core();
+String xyStage = mmc.getXYStageDevice();
+
+if (xyStage == null || xyStage.isEmpty()) {
+   mm.scripter().message("Error: No XY stage device configured.");
+   return;
+}
+
+// Store starting position to return to later
+double startX = mmc.getXPosition(xyStage);
+double startY = mmc.getYPosition(xyStage);
+
+// Get image dimensions
+int imageWidth = (int) mmc.getImageWidth();
+int imageHeight = (int) mmc.getImageHeight();
+int bitDepth = (int) mmc.getImageBitDepth();
+double pixelSizeUm = mmc.getPixelSizeUm();
+
+if (pixelSizeUm <= 0) {
+   mm.scripter().message("Warning: Pixel size not calibrated, using 1.0 um");
+   pixelSizeUm = 1.0;
+}
+
+mm.scripter().message("Image size: " + imageWidth + " x " + imageHeight + " pixels");
+mm.scripter().message("Pixel size: " + pixelSizeUm + " um");
+mm.scripter().message("Starting position: X=" + startX + ", Y=" + startY);
+
+// Create summary metadata using direct JSON puts
+// (AcqEngMetadata setter methods may not all be available)
+JSONObject summaryMetadata = new JSONObject();
+summaryMetadata.put("Width", imageWidth);
+summaryMetadata.put("Height", imageHeight);
+summaryMetadata.put("PixelSize_um", pixelSizeUm);
+summaryMetadata.put("BitDepth", bitDepth);
+summaryMetadata.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
+summaryMetadata.put("GridPixelOverlapX", overlapPixels);
+summaryMetadata.put("GridPixelOverlapY", overlapPixels);
+
+// Create NDTiff storage (multi-resolution for proper stitching)
+MultiresNDTiffAPI storage;
+String storageDir;
+if (saveDir != null) {
+   storageDir = saveDir;
+} else {
+   // Create temporary directory for storage
+   File tempDir = File.createTempFile("ndviewer", "");
+   tempDir.delete();
+   tempDir.mkdir();
+   storageDir = tempDir.getAbsolutePath();
+}
+
+storage = new NDTiffStorage(storageDir, acqName, summaryMetadata,
+      overlapPixels, overlapPixels, true, null, 20, null, true);
+
+// Store reference to storage for use in inner class
+unset("storageRef");
+final MultiresNDTiffAPI storageRef = storage;
+
+// Create a data source that wraps storage for the viewer
+// Using Beanshell's approach to implementing interfaces
+dataSourceHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      String methodName = method.getName();
+
+      if (methodName.equals("getBounds")) {
+         // Return null to enable unbounded panning (like Magellan explore mode)
+         return null;
+      }
+      else if (methodName.equals("getImageForDisplay")) {
+         HashMap axes = (HashMap) args[0];
+         int resolutionIndex = ((Integer) args[1]).intValue();
+         double xOffset = ((Double) args[2]).doubleValue();
+         double yOffset = ((Double) args[3]).doubleValue();
+         int displayWidth = ((Integer) args[4]).intValue();
+         int displayHeight = ((Integer) args[5]).intValue();
+         return storageRef.getDisplayImage(axes, resolutionIndex,
+               (int) xOffset, (int) yOffset, displayWidth, displayHeight);
+      }
+      else if (methodName.equals("getImageKeys")) {
+         // Remove row/col from axes so viewer treats images as one stitched view
+         Set result = new HashSet();
+         for (Object axesObj : storageRef.getAxesSet()) {
+            HashMap axes = new HashMap((HashMap) axesObj);
+            axes.remove("row");
+            axes.remove("column");
+            result.add(axes);
+         }
+         return result;
+      }
+      else if (methodName.equals("getMaxResolutionIndex")) {
+         return Integer.valueOf(storageRef.getNumResLevels() - 1);
+      }
+      else if (methodName.equals("increaseMaxResolutionLevel")) {
+         int level = ((Integer) args[0]).intValue();
+         storageRef.increaseMaxResolutionLevel(level);
+         return null;
+      }
+      else if (methodName.equals("getDiskLocation")) {
+         return storageRef.getDiskLocation();
+      }
+      else if (methodName.equals("close")) {
+         storageRef.close();
+         return null;
+      }
+      else if (methodName.equals("getImageBitDepth")) {
+         HashMap axesPositions = (HashMap) args[0];
+         return Integer.valueOf(storageRef.getEssentialImageMetadata(axesPositions).bitDepth);
+      }
+      return null;
+   }
+};
+
+NDViewerDataSource dataSource = (NDViewerDataSource) Proxy.newProxyInstance(
+   NDViewerDataSource.class.getClassLoader(),
+   new Class[] { NDViewerDataSource.class },
+   dataSourceHandler
+);
+
+// Create acquisition interface (simple version for scripting)
+// Track state with mutable holder
+acqState = new Object() {
+   boolean finished = false;
+   boolean paused = false;
+};
+
+acqInterfaceHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      String methodName = method.getName();
+
+      if (methodName.equals("isFinished")) {
+         return Boolean.valueOf(acqState.finished);
+      }
+      else if (methodName.equals("abort")) {
+         acqState.finished = true;
+         return null;
+      }
+      else if (methodName.equals("setPaused")) {
+         acqState.paused = ((Boolean) args[0]).booleanValue();
+         return null;
+      }
+      else if (methodName.equals("isPaused")) {
+         return Boolean.valueOf(acqState.paused);
+      }
+      else if (methodName.equals("waitForCompletion")) {
+         return null;
+      }
+      return null;
+   }
+};
+
+NDViewerAcqInterface acqInterface = (NDViewerAcqInterface) Proxy.newProxyInstance(
+   NDViewerAcqInterface.class.getClassLoader(),
+   new Class[] { NDViewerAcqInterface.class },
+   acqInterfaceHandler
+);
+
+// Create Function proxies for metadata readers
+// Time metadata function - reads elapsed time from image tags
+timeMetadataHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      String methodName = method.getName();
+      if (methodName.equals("apply")) {
+         JSONObject tags = (JSONObject) args[0];
+         try {
+            if (tags.has("ElapsedTime-ms")) {
+               return Long.valueOf(tags.getLong("ElapsedTime-ms"));
+            }
+         } catch (Exception e) { }
+         return Long.valueOf(0);
+      }
+      return null;
+   }
+};
+
+java.util.function.Function timeMetadataFunction = (java.util.function.Function) Proxy.newProxyInstance(
+   java.util.function.Function.class.getClassLoader(),
+   new Class[] { java.util.function.Function.class },
+   timeMetadataHandler
+);
+
+// Z metadata function - reads Z position from image tags
+zMetadataHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      String methodName = method.getName();
+      if (methodName.equals("apply")) {
+         JSONObject tags = (JSONObject) args[0];
+         try {
+            if (tags.has("ZPosition_um_Intended")) {
+               return Double.valueOf(tags.getDouble("ZPosition_um_Intended"));
+            }
+         } catch (Exception e) { }
+         return Double.valueOf(0.0);
+      }
+      return null;
+   }
+};
+
+java.util.function.Function zMetadataFunction = (java.util.function.Function) Proxy.newProxyInstance(
+   java.util.function.Function.class.getClassLoader(),
+   new Class[] { java.util.function.Function.class },
+   zMetadataHandler
+);
+
+// Create and show the NDViewer
+NDViewerAPI viewer = new NDViewer(dataSource, acqInterface, summaryMetadata,
+      pixelSizeUm, false);
+viewer.setWindowTitle("XY Grid Acquisition - " + acqName);
+
+// Set metadata reader functions for time and Z display
+viewer.setReadTimeMetadataFunction(timeMetadataFunction);
+viewer.setReadZMetadataFunction(zMetadataFunction);
+
+// Create a custom mouse listener for panning (right-drag) and zooming (scroll wheel)
+// This enables Magellan-like navigation in the stitched view
+unset ("viewerForMouse");
+final NDViewerAPI viewerForMouse = viewer;
+unset("ZOOM_FACTOR");
+final double ZOOM_FACTOR = 1.4;
+
+mouseListenerHandler = new InvocationHandler() {
+   Point dragStart = null;
+
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      String methodName = method.getName();
+
+      if (methodName.equals("mousePressed")) {
+         MouseEvent e = (MouseEvent) args[0];
+         if (SwingUtilities.isRightMouseButton(e)) {
+            dragStart = e.getPoint();
+         }
+         return null;
+      }
+      else if (methodName.equals("mouseReleased")) {
+         dragStart = null;
+         return null;
+      }
+      else if (methodName.equals("mouseDragged")) {
+         MouseEvent e = (MouseEvent) args[0];
+         if (dragStart != null && SwingUtilities.isRightMouseButton(e)) {
+            Point current = e.getPoint();
+            viewerForMouse.pan(dragStart.x - current.x, dragStart.y - current.y);
+            dragStart = current;
+         }
+         return null;
+      }
+      else if (methodName.equals("mouseWheelMoved")) {
+         MouseWheelEvent e = (MouseWheelEvent) args[0];
+         Point mouseLoc = e.getPoint();
+         if (e.getWheelRotation() < 0) {
+            viewerForMouse.zoom(1.0 / ZOOM_FACTOR, mouseLoc);
+         } else if (e.getWheelRotation() > 0) {
+            viewerForMouse.zoom(ZOOM_FACTOR, mouseLoc);
+         }
+         return null;
+      }
+      // Return null for other mouse events (mouseClicked, mouseMoved, mouseEntered, mouseExited)
+      return null;
+   }
+};
+
+CanvasMouseListenerInterface mouseListener = (CanvasMouseListenerInterface) Proxy.newProxyInstance(
+   CanvasMouseListenerInterface.class.getClassLoader(),
+   new Class[] { CanvasMouseListenerInterface.class },
+   mouseListenerHandler
+);
+
+viewer.setCustomCanvasMouseListener(mouseListener);
+
+// Fix for histogram "contamination" - ensure canvas properly clears its background
+// by setting it opaque with a black background
+javax.swing.JPanel canvasPanel = viewer.getCanvasJPanel();
+canvasPanel.setOpaque(true);
+canvasPanel.setBackground(java.awt.Color.BLACK);
+
+mm.scripter().message("NDViewer created, starting acquisition...");
+
+// Create executor for display updates
+ExecutorService displayExecutor = Executors.newSingleThreadExecutor();
+
+// Acquire images in a grid pattern
+long startTime = System.currentTimeMillis();
+int imageCount = 0;
+
+try {
+   for (int row = 0; row < numRows; row++) {
+      for (int col = 0; col < numCols; col++) {
+
+         // Calculate target position
+         // Grid is centered on starting position
+         double offsetX = (col - (numCols - 1) / 2.0) * stepSizeUm;
+         double offsetY = (row - (numRows - 1) / 2.0) * stepSizeUm;
+         double targetX = startX + offsetX;
+         double targetY = startY + offsetY;
+
+         // Move stage
+         mmc.setXYPosition(xyStage, targetX, targetY);
+         mmc.waitForDevice(xyStage);
+
+         // Small delay for settling
+         Thread.sleep(100);
+
+         // Get actual position after move
+         double actualX = mmc.getXPosition(xyStage);
+         double actualY = mmc.getYPosition(xyStage);
+
+         // Snap image
+         mmc.snapImage();
+         TaggedImage taggedImg = mmc.getTaggedImage();
+
+         // Add metadata using direct JSON puts
+         JSONObject tags = taggedImg.tags;
+         long elapsedTime = System.currentTimeMillis() - startTime;
+
+         tags.put("ElapsedTime-ms", elapsedTime);
+         tags.put("XPosition_um_Intended", targetX);
+         tags.put("YPosition_um_Intended", targetY);
+         tags.put("XPosition_um", actualX);
+         tags.put("YPosition_um", actualY);
+         tags.put("Width", imageWidth);
+         tags.put("Height", imageHeight);
+         tags.put("BitDepth", bitDepth);
+         tags.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
+
+         // Create axes with row and column for storage
+         HashMap axes = new HashMap();
+         axes.put("row", Integer.valueOf(row));
+         axes.put("column", Integer.valueOf(col));
+
+         // Store image (use putImage, not putImageMultiRes)
+         storage.putImage(taggedImg.pix, tags, axes,
+               false, bitDepth, imageHeight, imageWidth);
+
+         // Notify viewer (without row/col so it displays as stitched)
+         // Create displayAxes outside the Runnable to avoid Beanshell scoping issues
+         final HashMap displayAxes = new HashMap();
+         final NDViewerAPI viewerRef = viewer;
+
+         displayExecutor.submit(new Runnable() {
+            public void run() {
+               viewerRef.newImageArrived(displayAxes);
+            }
+         });
+
+         imageCount++;
+         mm.scripter().message("Acquired image " + imageCount + "/" + (numRows * numCols)
+               + " at row=" + row + ", col=" + col
+               + " (X=" + actualX + ", Y=" + actualY + ")");
+      }
+   }
+
+} finally {
+   // Return stage to starting position
+   mmc.setXYPosition(xyStage, startX, startY);
+   mmc.waitForDevice(xyStage);
+   mm.scripter().message("Returned to starting position");
+}
+
+// Finish up
+displayExecutor.shutdown();
+storage.finishedWriting();
+acqState.finished = true;
+viewer.setWindowTitle("XY Grid Acquisition - " + acqName + " (Finished)");
+
+mm.scripter().message("Done! Acquired " + imageCount + " images in a "
+      + numRows + "x" + numCols + " grid.");
+mm.scripter().message("Images are displayed stitched together in NDViewer.");
+mm.scripter().message("Data stored at: " + storage.getDiskLocation());
