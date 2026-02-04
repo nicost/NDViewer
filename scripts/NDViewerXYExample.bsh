@@ -38,6 +38,7 @@ import org.micromanager.ndviewer.main.NDViewer;
 import org.micromanager.ndviewer.overlay.Overlay;
 import org.micromanager.ndviewer.overlay.Roi;
 import org.micromanager.ndviewer.overlay.TextRoi;
+import org.micromanager.acqj.main.AcqEngMetadata;
 import java.awt.Point;
 import java.awt.Color;
 import java.awt.Font;
@@ -207,27 +208,50 @@ acquireTile(row, col, viewerRef) {
       tags.put("BitDepth", bitDepth);
       tags.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
 
-      // Create axes with row and column
-      HashMap axes = new HashMap();
-      axes.put("row", Integer.valueOf(row));
-      axes.put("column", Integer.valueOf(col));
+      // Create axes in metadata using AcqEngMetadata helper
+      // This properly sets up the "Axes" JSON structure that NDTiffStorage expects
+      AcqEngMetadata.createAxes(tags);
+      AcqEngMetadata.setAxisPosition(tags, "row", Integer.valueOf(row));
+      AcqEngMetadata.setAxisPosition(tags, "column", Integer.valueOf(col));
 
-      // Store image
-      storageRef.putImage(taggedImg.pix, tags, axes,
+      // Get the axes HashMap from the metadata
+      HashMap axes = AcqEngMetadata.getAxes(tags);
+
+      // Store image with multi-resolution pyramid generation
+      // putImageMultiRes creates the pyramid levels for proper zooming
+      // It returns a Future that completes when all resolution levels are written
+      java.util.concurrent.Future future = storageRef.putImageMultiRes(taggedImg.pix, tags, axes,
             false, bitDepth, imageHeight, imageWidth);
+
+      // Wait for the multi-resolution pyramid to be fully written
+      future.get();
 
       // Mark as acquired
       ((HashSet)mouseState.get("acquiredTiles")).add(tileKey);
+
+      // Log the resolution levels after the image is stored
+      int numResLevels = storageRef.getNumResLevels();
+
+      // Check which resolution levels have the image
+      String hasImageInfo = "hasImage: ";
+      for (int resLevel = 0; resLevel < numResLevels; resLevel++) {
+         boolean hasIt = storageRef.hasImage(axes, resLevel);
+         hasImageInfo = hasImageInfo + "res" + resLevel + "=" + hasIt + " ";
+      }
 
       // Notify viewer
       HashMap displayAxes = new HashMap();
       viewerRef.newImageArrived(displayAxes);
 
       mm.scripter().message("Acquired tile " + ((HashSet)mouseState.get("acquiredTiles")).size() +
-            " at row=" + row + ", col=" + col);
+            " at row=" + row + ", col=" + col + ", numResLevels=" + numResLevels + ", " + hasImageInfo);
 
    } catch (Exception e) {
       mm.scripter().message("Error acquiring tile: " + e.getMessage());
+      mm.scripter().message("Exception class: " + e.getClass().getName());
+      if (e.getCause() != null) {
+         mm.scripter().message("Caused by: " + e.getCause().getMessage());
+      }
       e.printStackTrace();
    }
 }
@@ -291,12 +315,19 @@ dataSourceHandler = new InvocationHandler() {
          double yOffset = ((Double) args[3]).doubleValue();
          int displayWidth = ((Integer) args[4]).intValue();
          int displayHeight = ((Integer) args[5]).intValue();
+
+         // Debug: log the request
+         int maxRes = storageRef.getNumResLevels() - 1;
+         mm.scripter().message("getImageForDisplay: requesting res=" + resolutionIndex +
+               " (max=" + maxRes + "), offset=(" + xOffset + ", " + yOffset + ")");
+
          Object result = storageRef.getDisplayImage(axes, resolutionIndex,
                (int) xOffset, (int) yOffset, displayWidth, displayHeight);
-         // Debug: log when images are requested
-         if (result != null) {
-            mm.scripter().message("getImageForDisplay: got image at offset (" +
-                  xOffset + ", " + yOffset + "), res=" + resolutionIndex);
+
+         if (result == null) {
+            mm.scripter().message("  -> NO IMAGE RETURNED");
+         } else {
+            mm.scripter().message("  -> got image");
          }
          return result;
       }
