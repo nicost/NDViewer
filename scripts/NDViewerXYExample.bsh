@@ -4,13 +4,17 @@
 // to display images acquired at different XY stage positions.
 //
 // This script:
-// 1. Snaps 4 images at different XY locations (in a 2x2 grid pattern)
+// 1. Snaps images at different XY locations (in a grid pattern)
 // 2. Stores them in NDTiff format with row/column coordinates
 // 3. Displays them in NDViewer at the appropriate XY locations (stitched view)
+// 4. Allows interactive acquisition: right-click shows blue tile with
+//    "Left click to acquire", left-click acquires the tile
 //
-// The key insight is that NDViewer with multi-resolution NDTiff storage
-// can stitch images together based on their row/column indices and the
-// overlap settings, displaying them as one continuous field of view.
+// Navigation:
+// - Right-click and drag to pan
+// - Mouse wheel to zoom
+// - Right-click on empty area to highlight tile for acquisition
+// - Left-click on highlighted tile to acquire it
 
 import java.io.File;
 import java.util.HashMap;
@@ -29,29 +33,37 @@ import org.micromanager.ndviewer.api.NDViewerAPI;
 import org.micromanager.ndviewer.api.NDViewerAcqInterface;
 import org.micromanager.ndviewer.api.NDViewerDataSource;
 import org.micromanager.ndviewer.api.CanvasMouseListenerInterface;
+import org.micromanager.ndviewer.api.OverlayerPlugin;
 import org.micromanager.ndviewer.main.NDViewer;
+import org.micromanager.ndviewer.overlay.Overlay;
+import org.micromanager.ndviewer.overlay.Roi;
+import org.micromanager.ndviewer.overlay.TextRoi;
 import java.awt.Point;
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.geom.Point2D;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
 import javax.swing.SwingUtilities;
 
 // ======================== USER SETTINGS ========================
 
-// Grid size (2x2 = 4 images)
-int numRows = 2;
-int numCols = 2;
+// Initial grid size (2x2 = 4 images) - can be expanded interactively
+int initialRows = 2;
+int initialCols = 2;
 
 // Stage movement step in microns (distance between tile centers)
-// Adjust based on your camera FOV and desired overlap
+// This should match your camera FOV for seamless tiling
 double stepSizeUm = 100.0;  // Microns between positions
 
 // Overlap in pixels (how much adjacent tiles overlap)
 // Set to 0 for no overlap, or positive value for overlapping tiles
 int overlapPixels = 0;
 
-// Save directory (set to null for RAM-only, no disk storage)
+// Save directory (set to null for temporary storage)
 String saveDir = null;  // Example: "C:\\temp\\NDViewerTest"
-String acqName = "XYGrid_" + System.currentTimeMillis();
+String acqName = "XYExplore_" + System.currentTimeMillis();
 
 // ===============================================================
 
@@ -64,7 +76,7 @@ if (xyStage == null || xyStage.isEmpty()) {
    return;
 }
 
-// Store starting position to return to later
+// Store starting position (will be the center of the grid)
 double startX = mmc.getXPosition(xyStage);
 double startY = mmc.getYPosition(xyStage);
 
@@ -79,12 +91,16 @@ if (pixelSizeUm <= 0) {
    pixelSizeUm = 1.0;
 }
 
+// Calculate tile size in pixels (accounting for overlap)
+int tileWidth = imageWidth - overlapPixels;
+int tileHeight = imageHeight - overlapPixels;
+
 mm.scripter().message("Image size: " + imageWidth + " x " + imageHeight + " pixels");
+mm.scripter().message("Tile step: " + tileWidth + " x " + tileHeight + " pixels");
 mm.scripter().message("Pixel size: " + pixelSizeUm + " um");
 mm.scripter().message("Starting position: X=" + startX + ", Y=" + startY);
 
-// Create summary metadata using direct JSON puts
-// (AcqEngMetadata setter methods may not all be available)
+// Create summary metadata
 JSONObject summaryMetadata = new JSONObject();
 summaryMetadata.put("Width", imageWidth);
 summaryMetadata.put("Height", imageHeight);
@@ -94,35 +110,179 @@ summaryMetadata.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
 summaryMetadata.put("GridPixelOverlapX", overlapPixels);
 summaryMetadata.put("GridPixelOverlapY", overlapPixels);
 
-// Create NDTiff storage (multi-resolution for proper stitching)
-MultiresNDTiffAPI storage;
+// Create NDTiff storage
 String storageDir;
 if (saveDir != null) {
    storageDir = saveDir;
 } else {
-   // Create temporary directory for storage
    File tempDir = File.createTempFile("ndviewer", "");
    tempDir.delete();
    tempDir.mkdir();
    storageDir = tempDir.getAbsolutePath();
 }
 
+mm.scripter().message("Creating NDTiff storage in: " + storageDir);
+mm.scripter().message("Acquisition name: " + acqName);
+
+// Clear any previous storage reference
+unset("storage");
+unset("storageRef");
+
 storage = new NDTiffStorage(storageDir, acqName, summaryMetadata,
       overlapPixels, overlapPixels, true, null, 20, null, true);
 
-// Store reference to storage for use in inner class
+mm.scripter().message("Storage created, checking existing axes: " + storage.getAxesSet());
+
+// Track acquired tiles and state for interactive acquisition
+// Use a HashMap to hold mutable state that can be accessed from inner classes
+// Clear any existing state from previous runs
+unset("mouseState");
+mouseState = new HashMap();
+acquiredTilesSet = new HashSet();  // Set of "row,col" strings
+mouseState.put("acquiredTiles", acquiredTilesSet);
+mouseState.put("highlightedTile", null);  // Point(row, col) of tile to highlight, or null
+mm.scripter().message("Initialized mouseState, acquiredTiles size: " + acquiredTilesSet.size());
+
+// Acquisition start time for metadata
+startTime = System.currentTimeMillis();
+
+// Store references for use in inner classes
 unset("storageRef");
 final MultiresNDTiffAPI storageRef = storage;
 
-// Create a data source that wraps storage for the viewer
-// Using Beanshell's approach to implementing interfaces
+// ============== Helper function to acquire a tile ==============
+acquireTile(row, col, viewerRef) {
+   // Calculate stage position for this tile
+   double targetX = startX + col * stepSizeUm;
+   double targetY = startY + row * stepSizeUm;
+
+   String tileKey = row + "," + col;
+   HashSet tiles = (HashSet)mouseState.get("acquiredTiles");
+   mm.scripter().message("acquireTile: key='" + tileKey + "', set=" + tiles + ", contains=" + tiles.contains(tileKey));
+
+   // Also check if storage already has this tile
+   HashMap checkAxes = new HashMap();
+   checkAxes.put("row", Integer.valueOf(row));
+   checkAxes.put("column", Integer.valueOf(col));
+   boolean inStorage = storageRef.hasImage(checkAxes, 0);
+   mm.scripter().message("acquireTile: in storage=" + inStorage);
+
+   if (tiles.contains(tileKey)) {
+      mm.scripter().message("Tile at row=" + row + ", col=" + col + " already acquired (in our set)");
+      return;
+   }
+   if (inStorage) {
+      mm.scripter().message("Tile at row=" + row + ", col=" + col + " already in storage, adding to set");
+      tiles.add(tileKey);
+      return;
+   }
+
+   mm.scripter().message("Acquiring tile at row=" + row + ", col=" + col +
+         " (X=" + targetX + ", Y=" + targetY + ")");
+
+   try {
+      // Move stage
+      mmc.setXYPosition(xyStage, targetX, targetY);
+      mmc.waitForDevice(xyStage);
+      Thread.sleep(100);  // Settling time
+
+      // Get actual position
+      double actualX = mmc.getXPosition(xyStage);
+      double actualY = mmc.getYPosition(xyStage);
+
+      // Snap image
+      mmc.snapImage();
+      TaggedImage taggedImg = mmc.getTaggedImage();
+
+      // Add metadata
+      JSONObject tags = taggedImg.tags;
+      long elapsedTime = System.currentTimeMillis() - startTime;
+      tags.put("ElapsedTime-ms", elapsedTime);
+      tags.put("XPosition_um_Intended", targetX);
+      tags.put("YPosition_um_Intended", targetY);
+      tags.put("XPosition_um", actualX);
+      tags.put("YPosition_um", actualY);
+      tags.put("Width", imageWidth);
+      tags.put("Height", imageHeight);
+      tags.put("BitDepth", bitDepth);
+      tags.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
+
+      // Create axes with row and column
+      HashMap axes = new HashMap();
+      axes.put("row", Integer.valueOf(row));
+      axes.put("column", Integer.valueOf(col));
+
+      // Store image
+      storageRef.putImage(taggedImg.pix, tags, axes,
+            false, bitDepth, imageHeight, imageWidth);
+
+      // Mark as acquired
+      ((HashSet)mouseState.get("acquiredTiles")).add(tileKey);
+
+      // Notify viewer
+      HashMap displayAxes = new HashMap();
+      viewerRef.newImageArrived(displayAxes);
+
+      mm.scripter().message("Acquired tile " + ((HashSet)mouseState.get("acquiredTiles")).size() +
+            " at row=" + row + ", col=" + col);
+
+   } catch (Exception e) {
+      mm.scripter().message("Error acquiring tile: " + e.getMessage());
+      e.printStackTrace();
+   }
+}
+
+// ============== Helper to convert display coords to tile indices ==============
+getTileFromDisplayCoords(displayX, displayY, viewerRef) {
+   // Get view offset and magnification
+   Point2D.Double viewOffset = viewerRef.getViewOffset();
+   double mag = viewerRef.getMagnification();
+
+   mm.scripter().message("Coord calc: display(" + displayX + "," + displayY +
+         "), viewOffset(" + viewOffset.x + "," + viewOffset.y +
+         "), mag=" + mag);
+
+   // Sanity check - if view offset is invalid (Integer.MIN_VALUE), use 0
+   double vx = viewOffset.x;
+   double vy = viewOffset.y;
+   if (vx < -1e9 || vx > 1e9) {
+      mm.scripter().message("WARNING: Invalid viewOffset.x, using 0");
+      vx = 0;
+   }
+   if (vy < -1e9 || vy > 1e9) {
+      mm.scripter().message("WARNING: Invalid viewOffset.y, using 0");
+      vy = 0;
+   }
+   if (mag <= 0 || mag > 1000) {
+      mm.scripter().message("WARNING: Invalid magnification, using 1.0");
+      mag = 1.0;
+   }
+
+   // Convert display coordinates to full-resolution pixel coordinates
+   double fullResX = vx + displayX / mag;
+   double fullResY = vy + displayY / mag;
+
+   // Convert to tile indices
+   int col = (int) Math.floor(fullResX / tileWidth);
+   int row = (int) Math.floor(fullResY / tileHeight);
+
+   mm.scripter().message("  -> fullRes(" + fullResX + "," + fullResY +
+         ") -> tile(" + row + "," + col + ")");
+
+   return new Point(row, col);
+}
+
+// ============== Data Source ==============
 dataSourceHandler = new InvocationHandler() {
    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
       String methodName = method.getName();
 
-      if (methodName.equals("getBounds")) {
-         // Return null to enable unbounded panning (like Magellan explore mode)
-         return null;
+      if (methodName.equals("isFinished")) {
+         // Data source is never "finished" for explore mode
+         return Boolean.FALSE;
+      }
+      else if (methodName.equals("getBounds")) {
+         return null;  // Unbounded for explore mode
       }
       else if (methodName.equals("getImageForDisplay")) {
          HashMap axes = (HashMap) args[0];
@@ -131,11 +291,16 @@ dataSourceHandler = new InvocationHandler() {
          double yOffset = ((Double) args[3]).doubleValue();
          int displayWidth = ((Integer) args[4]).intValue();
          int displayHeight = ((Integer) args[5]).intValue();
-         return storageRef.getDisplayImage(axes, resolutionIndex,
+         Object result = storageRef.getDisplayImage(axes, resolutionIndex,
                (int) xOffset, (int) yOffset, displayWidth, displayHeight);
+         // Debug: log when images are requested
+         if (result != null) {
+            mm.scripter().message("getImageForDisplay: got image at offset (" +
+                  xOffset + ", " + yOffset + "), res=" + resolutionIndex);
+         }
+         return result;
       }
       else if (methodName.equals("getImageKeys")) {
-         // Remove row/col from axes so viewer treats images as one stitched view
          Set result = new HashSet();
          for (Object axesObj : storageRef.getAxesSet()) {
             HashMap axes = new HashMap((HashMap) axesObj);
@@ -162,7 +327,19 @@ dataSourceHandler = new InvocationHandler() {
       }
       else if (methodName.equals("getImageBitDepth")) {
          HashMap axesPositions = (HashMap) args[0];
-         return Integer.valueOf(storageRef.getEssentialImageMetadata(axesPositions).bitDepth);
+         try {
+            return Integer.valueOf(storageRef.getEssentialImageMetadata(axesPositions).bitDepth);
+         } catch (Exception e) {
+            return Integer.valueOf(bitDepth);  // fallback to configured bit depth
+         }
+      }
+      // Default returns for unhandled methods
+      Class returnType = method.getReturnType();
+      if (returnType == boolean.class || returnType == Boolean.class) {
+         return Boolean.FALSE;
+      }
+      if (returnType == int.class || returnType == Integer.class) {
+         return Integer.valueOf(0);
       }
       return null;
    }
@@ -174,33 +351,38 @@ NDViewerDataSource dataSource = (NDViewerDataSource) Proxy.newProxyInstance(
    dataSourceHandler
 );
 
-// Create acquisition interface (simple version for scripting)
-// Track state with mutable holder
-acqState = new Object() {
-   boolean finished = false;
-   boolean paused = false;
-};
+// ============== Acquisition Interface ==============
+// Use HashMap for state to avoid Beanshell scoping issues in InvocationHandler
+unset("acqState");
+acqState = new HashMap();
+acqState.put("finished", Boolean.FALSE);
+acqState.put("paused", Boolean.FALSE);
 
 acqInterfaceHandler = new InvocationHandler() {
    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
       String methodName = method.getName();
-
       if (methodName.equals("isFinished")) {
-         return Boolean.valueOf(acqState.finished);
+         Boolean result = (Boolean) acqState.get("finished");
+         return result != null ? result : Boolean.FALSE;
       }
       else if (methodName.equals("abort")) {
-         acqState.finished = true;
+         acqState.put("finished", Boolean.TRUE);
          return null;
       }
       else if (methodName.equals("setPaused")) {
-         acqState.paused = ((Boolean) args[0]).booleanValue();
+         acqState.put("paused", (Boolean) args[0]);
          return null;
       }
       else if (methodName.equals("isPaused")) {
-         return Boolean.valueOf(acqState.paused);
+         Boolean result = (Boolean) acqState.get("paused");
+         return result != null ? result : Boolean.FALSE;
       }
       else if (methodName.equals("waitForCompletion")) {
          return null;
+      }
+      // Default for any other method - return false for booleans
+      if (method.getReturnType() == boolean.class || method.getReturnType() == Boolean.class) {
+         return Boolean.FALSE;
       }
       return null;
    }
@@ -212,12 +394,10 @@ NDViewerAcqInterface acqInterface = (NDViewerAcqInterface) Proxy.newProxyInstanc
    acqInterfaceHandler
 );
 
-// Create Function proxies for metadata readers
-// Time metadata function - reads elapsed time from image tags
+// ============== Metadata Functions ==============
 timeMetadataHandler = new InvocationHandler() {
    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-      String methodName = method.getName();
-      if (methodName.equals("apply")) {
+      if (method.getName().equals("apply")) {
          JSONObject tags = (JSONObject) args[0];
          try {
             if (tags.has("ElapsedTime-ms")) {
@@ -236,11 +416,9 @@ java.util.function.Function timeMetadataFunction = (java.util.function.Function)
    timeMetadataHandler
 );
 
-// Z metadata function - reads Z position from image tags
 zMetadataHandler = new InvocationHandler() {
    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-      String methodName = method.getName();
-      if (methodName.equals("apply")) {
+      if (method.getName().equals("apply")) {
          JSONObject tags = (JSONObject) args[0];
          try {
             if (tags.has("ZPosition_um_Intended")) {
@@ -259,45 +437,179 @@ java.util.function.Function zMetadataFunction = (java.util.function.Function) Pr
    zMetadataHandler
 );
 
-// Create and show the NDViewer
+// ============== Create NDViewer ==============
+mm.scripter().message("Creating NDViewer...");
 NDViewerAPI viewer = new NDViewer(dataSource, acqInterface, summaryMetadata,
       pixelSizeUm, false);
-viewer.setWindowTitle("XY Grid Acquisition - " + acqName);
+mm.scripter().message("NDViewer created, setting title...");
+viewer.setWindowTitle("XY Explore - " + acqName + " (Right-click to select tile, Left-click to acquire)");
 
-// Set metadata reader functions for time and Z display
 viewer.setReadTimeMetadataFunction(timeMetadataFunction);
 viewer.setReadZMetadataFunction(zMetadataFunction);
 
-// Create a custom mouse listener for panning (right-drag) and zooming (scroll wheel)
-// This enables Magellan-like navigation in the stitched view
-unset ("viewerForMouse");
-final NDViewerAPI viewerForMouse = viewer;
+// Store viewer reference for callbacks
+unset("viewerRef");
+final NDViewerAPI viewerRef = viewer;
+
+// ============== Overlayer Plugin for tile highlighting ==============
+overlayerHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if (method.getName().equals("drawOverlay")) {
+         Overlay overlay = (Overlay) args[0];
+         Point2D.Double displayImageSize = (Point2D.Double) args[1];
+         double downsampleFactor = ((Double) args[2]).doubleValue();
+         Graphics g = (Graphics) args[3];
+         HashMap axes = (HashMap) args[4];
+         double magnification = ((Double) args[5]).doubleValue();
+         Point2D.Double viewOffset = (Point2D.Double) args[6];
+
+         // Debug: always log when drawOverlay is called
+         Object ht = mouseState.get("highlightedTile");
+
+         // Draw highlighted tile if any
+         if (ht != null) {
+            int row = ((Point)ht).x;
+            int col = ((Point)ht).y;
+            String tileKey = row + "," + col;
+            mm.scripter().message("Overlay: drawing highlight for row=" + row + ", col=" + col +
+                  ", mag=" + magnification + ", viewOffset=(" + viewOffset.x + "," + viewOffset.y + ")");
+
+            // Only show if not already acquired
+            if (!((HashSet)mouseState.get("acquiredTiles")).contains(tileKey)) {
+               // Calculate tile position in full resolution coordinates
+               double tilePixelX = col * tileWidth;
+               double tilePixelY = row * tileHeight;
+
+               // Convert to DISPLAY/SCREEN coordinates
+               // ROIs in NDViewer are drawn in screen coordinates (after the image transform)
+               int dispX = (int) ((tilePixelX - viewOffset.x) * magnification);
+               int dispY = (int) ((tilePixelY - viewOffset.y) * magnification);
+               int dispW = (int) (tileWidth * magnification);
+               int dispH = (int) (tileHeight * magnification);
+
+               mm.scripter().message("  tile pixel pos: (" + tilePixelX + "," + tilePixelY +
+                     ") -> display pos: (" + dispX + "," + dispY + "), size: " + dispW + "x" + dispH);
+
+               // Create a rectangle ROI at the tile position (DISPLAY coordinates)
+               Roi rectRoi = new Roi(dispX, dispY, dispW, dispH);
+               rectRoi.setStrokeColor(new Color(0, 100, 255));
+               rectRoi.setStrokeWidth(3);
+               rectRoi.setFillColor(new Color(0, 100, 255, 100));
+               overlay.add(rectRoi);
+
+               // Add text ROI for instructions (centered in tile)
+               String text = "Left-click to acquire";
+               int textX = dispX + dispW / 4;  // Offset from left edge
+               int textY = dispY + dispH / 2;
+               TextRoi textRoi = new TextRoi(textX, textY, text);
+               textRoi.setStrokeColor(Color.WHITE);
+               overlay.add(textRoi);
+
+               // Add text ROI for coordinates
+               String coordText = "Row: " + row + ", Col: " + col;
+               TextRoi coordRoi = new TextRoi(textX, textY + 20, coordText);
+               coordRoi.setStrokeColor(Color.YELLOW);
+               overlay.add(coordRoi);
+            }
+         }
+
+         // Pass overlay to viewer - this is what makes the overlay persistent!
+         viewerRef.setOverlay(overlay);
+         return null;
+      }
+      return null;
+   }
+};
+
+OverlayerPlugin overlayer = (OverlayerPlugin) Proxy.newProxyInstance(
+   OverlayerPlugin.class.getClassLoader(),
+   new Class[] { OverlayerPlugin.class },
+   overlayerHandler
+);
+
+viewer.setOverlayerPlugin(overlayer);
+
+// ============== Mouse Listener ==============
 unset("ZOOM_FACTOR");
 final double ZOOM_FACTOR = 1.4;
 
-mouseListenerHandler = new InvocationHandler() {
-   Point dragStart = null;
+// Initialize mouse drag state in mouseState HashMap
+mouseState.put("dragStart", null);
+mouseState.put("isDragging", Boolean.FALSE);
 
+mouseListenerHandler = new InvocationHandler() {
    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
       String methodName = method.getName();
 
       if (methodName.equals("mousePressed")) {
          MouseEvent e = (MouseEvent) args[0];
          if (SwingUtilities.isRightMouseButton(e)) {
-            dragStart = e.getPoint();
+            mouseState.put("dragStart", e.getPoint());
+            mouseState.put("isDragging", Boolean.FALSE);
          }
          return null;
       }
       else if (methodName.equals("mouseReleased")) {
-         dragStart = null;
+         MouseEvent e = (MouseEvent) args[0];
+         boolean isDragging = mouseState.get("isDragging") != null &&
+                              ((Boolean)mouseState.get("isDragging")).booleanValue();
+
+         if (SwingUtilities.isRightMouseButton(e) && !isDragging) {
+            // Right-click without drag - highlight tile for acquisition
+            Point tile = getTileFromDisplayCoords(e.getX(), e.getY(), viewerRef);
+            String tileKey = tile.x + "," + tile.y;
+
+            mm.scripter().message("Right-click at tile row=" + tile.x + ", col=" + tile.y +
+                  ", acquired=" + ((HashSet)mouseState.get("acquiredTiles")).contains(tileKey));
+
+            if (!((HashSet)mouseState.get("acquiredTiles")).contains(tileKey)) {
+               mouseState.put("highlightedTile", tile);
+               mm.scripter().message("Highlighting tile, calling redrawOverlay...");
+               viewerRef.redrawOverlay();
+            }
+         }
+         else if (SwingUtilities.isLeftMouseButton(e)) {
+            // Left-click - acquire highlighted tile if any
+            if (mouseState.get("highlightedTile") != null) {
+               // Capture values before clearing
+               int rowToAcquire = ((Point)mouseState.get("highlightedTile")).x;
+               int colToAcquire = ((Point)mouseState.get("highlightedTile")).y;
+               mouseState.put("highlightedTile", null);  // Clear highlight
+
+               mm.scripter().message("Left-click: acquiring tile row=" + rowToAcquire + ", col=" + colToAcquire);
+
+               // Store coordinates for background execution
+               mouseState.put("pendingRow", Integer.valueOf(rowToAcquire));
+               mouseState.put("pendingCol", Integer.valueOf(colToAcquire));
+               mouseState.put("pendingAcquire", Boolean.TRUE);
+            } else {
+               mm.scripter().message("Left-click: no tile highlighted");
+            }
+         }
+
+         mouseState.put("dragStart", null);
+         mouseState.put("isDragging", Boolean.FALSE);
          return null;
       }
       else if (methodName.equals("mouseDragged")) {
          MouseEvent e = (MouseEvent) args[0];
+         Point dragStart = (Point) mouseState.get("dragStart");
          if (dragStart != null && SwingUtilities.isRightMouseButton(e)) {
             Point current = e.getPoint();
-            viewerForMouse.pan(dragStart.x - current.x, dragStart.y - current.y);
-            dragStart = current;
+            int dx = dragStart.x - current.x;
+            int dy = dragStart.y - current.y;
+
+            // Only consider it dragging if moved more than a few pixels
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+               mouseState.put("isDragging", Boolean.TRUE);
+               mouseState.put("highlightedTile", null);  // Clear highlight when dragging
+            }
+
+            boolean isDragging = ((Boolean)mouseState.get("isDragging")).booleanValue();
+            if (isDragging) {
+               viewerRef.pan(dx, dy);
+               mouseState.put("dragStart", current);
+            }
          }
          return null;
       }
@@ -305,13 +617,16 @@ mouseListenerHandler = new InvocationHandler() {
          MouseWheelEvent e = (MouseWheelEvent) args[0];
          Point mouseLoc = e.getPoint();
          if (e.getWheelRotation() < 0) {
-            viewerForMouse.zoom(1.0 / ZOOM_FACTOR, mouseLoc);
+            viewerRef.zoom(1.0 / ZOOM_FACTOR, mouseLoc);
          } else if (e.getWheelRotation() > 0) {
-            viewerForMouse.zoom(ZOOM_FACTOR, mouseLoc);
+            viewerRef.zoom(ZOOM_FACTOR, mouseLoc);
          }
          return null;
       }
-      // Return null for other mouse events (mouseClicked, mouseMoved, mouseEntered, mouseExited)
+      else if (methodName.equals("mouseMoved")) {
+         // Could use this to show hover effect
+         return null;
+      }
       return null;
    }
 };
@@ -323,103 +638,102 @@ CanvasMouseListenerInterface mouseListener = (CanvasMouseListenerInterface) Prox
 );
 
 viewer.setCustomCanvasMouseListener(mouseListener);
+mm.scripter().message("Mouse listener set");
 
-// Fix for histogram "contamination" - ensure canvas properly clears its background
-// by setting it opaque with a black background
+// Fix canvas background
 javax.swing.JPanel canvasPanel = viewer.getCanvasJPanel();
 canvasPanel.setOpaque(true);
 canvasPanel.setBackground(java.awt.Color.BLACK);
 
-mm.scripter().message("NDViewer created, starting acquisition...");
-
-// Create executor for display updates
-ExecutorService displayExecutor = Executors.newSingleThreadExecutor();
-
-// Acquire images in a grid pattern
-long startTime = System.currentTimeMillis();
-int imageCount = 0;
-
+// ============== Acquire initial grid ==============
 try {
-   for (int row = 0; row < numRows; row++) {
-      for (int col = 0; col < numCols; col++) {
+   mm.scripter().message("Acquiring initial " + initialRows + "x" + initialCols + " grid...");
+   mm.scripter().message("Tile dimensions: " + tileWidth + " x " + tileHeight + " pixels");
 
-         // Calculate target position
-         // Grid is centered on starting position
-         double offsetX = (col - (numCols - 1) / 2.0) * stepSizeUm;
-         double offsetY = (row - (numRows - 1) / 2.0) * stepSizeUm;
-         double targetX = startX + offsetX;
-         double targetY = startY + offsetY;
+   // First, set view to origin (0,0) to ensure valid starting state
+   viewer.setViewOffset(0, 0);
+   mm.scripter().message("Initial view offset set to (0, 0)");
 
-         // Move stage
-         mmc.setXYPosition(xyStage, targetX, targetY);
-         mmc.waitForDevice(xyStage);
+   // Small delay to let viewer initialize
+   Thread.sleep(500);
 
-         // Small delay for settling
-         Thread.sleep(100);
-
-         // Get actual position after move
-         double actualX = mmc.getXPosition(xyStage);
-         double actualY = mmc.getYPosition(xyStage);
-
-         // Snap image
-         mmc.snapImage();
-         TaggedImage taggedImg = mmc.getTaggedImage();
-
-         // Add metadata using direct JSON puts
-         JSONObject tags = taggedImg.tags;
-         long elapsedTime = System.currentTimeMillis() - startTime;
-
-         tags.put("ElapsedTime-ms", elapsedTime);
-         tags.put("XPosition_um_Intended", targetX);
-         tags.put("YPosition_um_Intended", targetY);
-         tags.put("XPosition_um", actualX);
-         tags.put("YPosition_um", actualY);
-         tags.put("Width", imageWidth);
-         tags.put("Height", imageHeight);
-         tags.put("BitDepth", bitDepth);
-         tags.put("PixelType", bitDepth <= 8 ? "GRAY8" : "GRAY16");
-
-         // Create axes with row and column for storage
-         HashMap axes = new HashMap();
-         axes.put("row", Integer.valueOf(row));
-         axes.put("column", Integer.valueOf(col));
-
-         // Store image (use putImage, not putImageMultiRes)
-         storage.putImage(taggedImg.pix, tags, axes,
-               false, bitDepth, imageHeight, imageWidth);
-
-         // Notify viewer (without row/col so it displays as stitched)
-         // Create displayAxes outside the Runnable to avoid Beanshell scoping issues
-         final HashMap displayAxes = new HashMap();
-         final NDViewerAPI viewerRef = viewer;
-
-         displayExecutor.submit(new Runnable() {
-            public void run() {
-               viewerRef.newImageArrived(displayAxes);
-            }
-         });
-
-         imageCount++;
-         mm.scripter().message("Acquired image " + imageCount + "/" + (numRows * numCols)
-               + " at row=" + row + ", col=" + col
-               + " (X=" + actualX + ", Y=" + actualY + ")");
+   // Acquire tiles starting at (0,0) for simplicity
+   // The starting stage position corresponds to tile (0,0)
+   for (int r = 0; r < initialRows; r++) {
+      for (int c = 0; c < initialCols; c++) {
+         mm.scripter().message("About to acquire tile r=" + r + ", c=" + c);
+         acquireTile(r, c, viewer);
       }
    }
 
-} finally {
-   // Return stage to starting position
+   // Return to starting position
    mmc.setXYPosition(xyStage, startX, startY);
    mmc.waitForDevice(xyStage);
-   mm.scripter().message("Returned to starting position");
+
+   // Log current view state
+   mm.scripter().message("Current magnification: " + viewer.getMagnification());
+   Point2D.Double currentOffset = viewer.getViewOffset();
+   mm.scripter().message("Current view offset: (" + currentOffset.x + ", " + currentOffset.y + ")");
+} catch (Exception e) {
+   mm.scripter().message("ERROR during initial acquisition: " + e.getMessage());
+   e.printStackTrace();
 }
 
-// Finish up
-displayExecutor.shutdown();
-storage.finishedWriting();
-acqState.finished = true;
-viewer.setWindowTitle("XY Grid Acquisition - " + acqName + " (Finished)");
-
-mm.scripter().message("Done! Acquired " + imageCount + " images in a "
-      + numRows + "x" + numCols + " grid.");
-mm.scripter().message("Images are displayed stitched together in NDViewer.");
+mm.scripter().message("");
+mm.scripter().message("=== Interactive Explore Mode ===");
+mm.scripter().message("Initial grid acquired: " + ((HashSet)mouseState.get("acquiredTiles")).size() + " tiles");
+mm.scripter().message("");
+mm.scripter().message("Controls:");
+mm.scripter().message("  - Right-click + drag: Pan the view");
+mm.scripter().message("  - Mouse wheel: Zoom in/out");
+mm.scripter().message("  - Right-click (no drag): Select tile to acquire (turns blue)");
+mm.scripter().message("  - Left-click: Acquire the selected tile");
+mm.scripter().message("");
 mm.scripter().message("Data stored at: " + storage.getDiskLocation());
+
+// ============== Background acquisition thread ==============
+// This thread polls for pending acquisition requests from the mouse listener
+// (We can't create anonymous Thread classes inside InvocationHandler in Beanshell)
+
+// Create a Runnable using Proxy pattern
+acqRunnableHandler = new InvocationHandler() {
+   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if (method.getName().equals("run")) {
+         while (!((Boolean)acqState.get("finished")).booleanValue()) {
+            try {
+               // Check if there's a pending acquisition
+               if (mouseState.get("pendingAcquire") != null &&
+                   ((Boolean)mouseState.get("pendingAcquire")).booleanValue()) {
+
+                  int row = ((Integer)mouseState.get("pendingRow")).intValue();
+                  int col = ((Integer)mouseState.get("pendingCol")).intValue();
+                  mouseState.put("pendingAcquire", Boolean.FALSE);
+
+                  mm.scripter().message("Background thread: acquiring tile row=" + row + ", col=" + col);
+                  acquireTile(row, col, viewerRef);
+                  viewerRef.redrawOverlay();
+               }
+               Thread.sleep(100);  // Poll every 100ms
+            } catch (InterruptedException ie) {
+               break;
+            } catch (Exception e) {
+               mm.scripter().message("Background acquisition error: " + e.getMessage());
+               e.printStackTrace();
+            }
+         }
+         mm.scripter().message("Background acquisition thread stopped");
+      }
+      return null;
+   }
+};
+
+Runnable acqRunnable = (Runnable) Proxy.newProxyInstance(
+   Runnable.class.getClassLoader(),
+   new Class[] { Runnable.class },
+   acqRunnableHandler
+);
+
+// Start the background thread
+backgroundThread = new Thread(acqRunnable, "AcquisitionThread");
+backgroundThread.start();
+mm.scripter().message("Background acquisition thread started");
